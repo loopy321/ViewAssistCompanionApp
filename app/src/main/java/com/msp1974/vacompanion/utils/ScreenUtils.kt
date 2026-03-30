@@ -2,6 +2,7 @@ package com.msp1974.vacompanion.utils
 
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Color
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
@@ -12,14 +13,13 @@ import android.view.WindowManager
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.google.firebase.Firebase
-import com.google.firebase.crashlytics.crashlytics
 import com.msp1974.vacompanion.settings.APPConfig
 
 
 class ScreenUtils(val context: Context) : ContextWrapper(context) {
     var log = Logger()
     var config = APPConfig.getInstance(context)
+    private val firebase = FirebaseManager.getInstance()
     private var wakeLock: PowerManager.WakeLock? = null
     var initBrightness: Float = 0f
 
@@ -51,7 +51,7 @@ class ScreenUtils(val context: Context) : ContextWrapper(context) {
             }
         } catch (e: Exception) {
             log.e("Error setting screen brightness: $e")
-            Firebase.crashlytics.recordException(e)
+            firebase.logException(e)
         }
     }
 
@@ -119,7 +119,7 @@ class ScreenUtils(val context: Context) : ContextWrapper(context) {
             }
         } catch (e: SecurityException) {
             log.e("Error setting screen brightness mode: $e")
-            Firebase.crashlytics.recordException(e)
+            firebase.logException(e)
         }
     }
 
@@ -184,8 +184,12 @@ class ScreenUtils(val context: Context) : ContextWrapper(context) {
     }
 
     fun hideSystemUI(window: Window) {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            window.statusBarColor = Color.TRANSPARENT
+            window.navigationBarColor = Color.TRANSPARENT
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            WindowCompat.setDecorFitsSystemWindows(window, false)
             WindowInsetsControllerCompat(window, window.decorView).let { controller ->
                 controller.hide(WindowInsetsCompat.Type.systemBars())
                 controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE

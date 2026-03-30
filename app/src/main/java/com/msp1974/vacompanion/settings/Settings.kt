@@ -9,10 +9,9 @@ import android.provider.Settings.Secure
 import androidx.preference.PreferenceManager
 import androidx.core.content.edit
 import com.google.android.gms.common.util.ClientLibraryUtils.getPackageInfo
-import com.google.firebase.Firebase
-import com.google.firebase.crashlytics.crashlytics
 import com.msp1974.vacompanion.utils.Event
 import com.msp1974.vacompanion.utils.EventNotifier
+import com.msp1974.vacompanion.utils.FirebaseManager
 import com.msp1974.vacompanion.utils.Logger
 import org.json.JSONObject
 import java.util.UUID
@@ -38,6 +37,7 @@ enum class PageLoadingStage {
 class APPConfig(val context: Context) {
     private val sharedPrefs = PreferenceManager.getDefaultSharedPreferences(context.applicationContext)
     private val log = Logger()
+    private val firebase = FirebaseManager.getInstance()
     var eventBroadcaster: EventNotifier
     private var prefListener: Unit
 
@@ -64,6 +64,7 @@ class APPConfig(val context: Context) {
     var homeAssistantHTTPPort: Int = DEFAULT_HA_HTTP_PORT
     var homeAssistantURL: String = ""
     var homeAssistantDashboard: String = ""
+    var haScreensaverDashboard: String = "/dashboard-screensaver"
 
     var sampleRate: Int = 16000
     var audioChannels: Int = 1
@@ -197,6 +198,10 @@ class APPConfig(val context: Context) {
         onValueChangedListener(property, oldValue, newValue)
     }
 
+    var haNavigateScreensaver: Boolean by Delegates.observable(false) { property, oldValue, newValue ->
+        onValueChangedListener(property, oldValue, newValue)
+    }
+
     var motionDetectionSensitivity: Int by Delegates.observable(0) { property, oldValue, newValue ->
         onValueChangedListener(property, oldValue, newValue)
     }
@@ -210,6 +215,10 @@ class APPConfig(val context: Context) {
     }
 
     var lastActivity: Long by Delegates.observable(0) { property, oldValue, newValue ->
+        onValueChangedListener(property, oldValue, newValue)
+    }
+
+    var uiIdle: Boolean by Delegates.observable(false) { property, oldValue, newValue ->
         onValueChangedListener(property, oldValue, newValue)
     }
 
@@ -273,6 +282,12 @@ class APPConfig(val context: Context) {
     fun processSettings(settingString: String) {
         initSettings = true
         val settings = JSONObject(settingString)
+        val hasHaNavigateScreensaver = settings.has("ha_navigate_screensaver")
+        val configuredScreensaverPath = when {
+            settings.has("ha_screensaver_dashboard") -> settings.getString("ha_screensaver_dashboard").trim()
+            settings.has("screensaver_dashboard") -> settings.getString("screensaver_dashboard").trim()
+            else -> null
+        }
         if (settings.has("ha_port")) {
             homeAssistantHTTPPort = settings["ha_port"] as Int
         }
@@ -281,6 +296,13 @@ class APPConfig(val context: Context) {
         }
         if (settings.has("ha_dashboard")) {
             homeAssistantDashboard = settings["ha_dashboard"] as String
+        }
+        if (configuredScreensaverPath != null) {
+            haScreensaverDashboard = when {
+                configuredScreensaverPath.isBlank() -> ""
+                configuredScreensaverPath.startsWith("/") -> configuredScreensaverPath
+                else -> "/$configuredScreensaverPath"
+            }
         }
         if (settings.has("advanced_gain")) {
             useAdvancedGain = settings["advanced_gain"] as Boolean
@@ -369,6 +391,15 @@ class APPConfig(val context: Context) {
         if (settings.has("enable_motion_detection")) {
             enableMotionDetection = settings.getBoolean("enable_motion_detection")
         }
+        if (hasHaNavigateScreensaver) {
+            haNavigateScreensaver = settings.getBoolean("ha_navigate_screensaver")
+        } else if (settings.has("screen_saver") || configuredScreensaverPath != null) {
+            // Backward-compatible fallback for integrations that have not yet added the new setting key.
+            // Do not overwrite the current value for partial settings updates that do not touch screensaver config.
+            haNavigateScreensaver =
+                settings.optBoolean("screen_saver", screenSaver) &&
+                !(configuredScreensaverPath ?: haScreensaverDashboard).isBlank()
+        }
         if (settings.has("motion_detection_sensitivity")) {
             motionDetectionSensitivity = settings.getInt("motion_detection_sensitivity")
         }
@@ -386,7 +417,7 @@ class APPConfig(val context: Context) {
         }
 
 
-        Firebase.crashlytics.log("Settings update")
+        firebase.addToCrashLog("Settings update")
     }
 
     @SuppressLint("HardwareIds")
@@ -410,14 +441,14 @@ class APPConfig(val context: Context) {
     fun onSharedPreferenceChangedListener(prefs: SharedPreferences, key: String?) {
         log.d("SharedPreference changed: $key")
         val event = Event(key.toString(), "", "")
-        Firebase.crashlytics.log("${key.toString()} changed")
+        firebase.addToCrashLog("${key.toString()} changed")
         eventBroadcaster.notifyEvent(event)
     }
 
     fun onValueChangedListener(property: KProperty<*>, oldValue: Any, newValue: Any) {
         if (oldValue != newValue) {
             val event = Event(property.name, oldValue, newValue)
-            Firebase.crashlytics.log("${property.name} changed from $oldValue to $newValue")
+            firebase.addToCrashLog("${property.name} changed from $oldValue to $newValue")
             eventBroadcaster.notifyEvent(event)
         }
     }
