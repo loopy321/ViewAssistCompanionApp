@@ -27,6 +27,12 @@ class MicrophoneInput (
 
     private var audioDSP = AudioDSP()
 
+    // Temporary stability guard for Lenovo/MediaTek/Dolby devices.
+    // Android AudioEffect creation can route into vendor HAL/Dolby/DMS and has
+    // been observed to make android.hardware.audio@5.0-service-mediatek grow to
+    // about 500 MB RSS.
+    private val disableAndroidAudioEffects: Boolean = true
+
     private val bufferSize =
         AudioRecord.getMinBufferSize(sampleRateInHz, channelConfig, audioFormat)
 
@@ -41,7 +47,10 @@ class MicrophoneInput (
         }
 
         if (!isRecording) {
-            Timber.d("Starting microphone with AGC=${agc != null}, AEC=${aec != null}, NS=${ns != null}")
+            Timber.d(
+                "Starting microphone with AndroidAudioEffectsDisabled=$disableAndroidAudioEffects, " +
+                    "AGC=${agc != null}, AEC=${aec != null}, NS=${ns != null}, Speex=true"
+            )
             audioRecord?.startRecording()
         } else {
             Timber.w("Microphone already started")
@@ -62,7 +71,7 @@ class MicrophoneInput (
         val audioRecord = this.audioRecord ?: error("Microphone not started")
         val readCount = audioRecord.read(audioBuffer, 0, audioBuffer.size)
         if (readCount > 0) {
-            if (useSpeex && !AutomaticGainControl.isAvailable()) {
+            if (useSpeex) {
                 speex.echoSuppressionEnabled = false
                 speex.denoiseEnabled = false
                 speex.setMaxAGCGain(10f + (config.micGain * 1.95f))
@@ -98,22 +107,45 @@ class MicrophoneInput (
     }
 
     private fun setupAudioEffects() {
+        if (disableAndroidAudioEffects) {
+            agc = null
+            aec = null
+            ns = null
+            Timber.w("Android audio effects disabled for stability; using software/Speex path")
+            return
+        }
+
         val sessionId = audioRecord?.audioSessionId ?: return
+
         try {
             if (AutomaticGainControl.isAvailable()) {
                 agc = AutomaticGainControl.create(sessionId)
                 agc?.enabled = true
             }
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to enable Android AutomaticGainControl")
+            agc = null
+        }
+
+        try {
             if (AcousticEchoCanceler.isAvailable()) {
                 aec = AcousticEchoCanceler.create(sessionId)
                 aec?.enabled = true
             }
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to enable Android AcousticEchoCanceler")
+            aec = null
+        }
 
+        try {
             if (NoiseSuppressor.isAvailable()) {
                 ns = NoiseSuppressor.create(sessionId)
                 ns?.enabled = true
             }
-        } catch (e: Exception) {}
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to enable Android NoiseSuppressor")
+            ns = null
+        }
     }
 
     override fun close() {
