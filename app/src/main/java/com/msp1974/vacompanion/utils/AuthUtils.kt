@@ -11,6 +11,7 @@ import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import kotlinx.serialization.json.*
+import java.util.Base64
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
@@ -24,25 +25,40 @@ class AuthUtils(val config: APPConfig) {
 
     // Add external auth callback for HA authentication
     val externalAuthCallback = object : ExternalAuthCallback {
+        private val refreshHandler = Handler(Looper.getMainLooper())
+        private var refreshRunnable: Runnable? = null
+
         override fun onRequestExternalAuth(view: WebView) {
             log.d("External auth callback in progress...")
             setAuthStage(view, PageLoadingStage.AUTHORISING)
+            val effectiveExpiry = getEffectiveTokenExpiry()
+            val remainingMs = effectiveExpiry - System.currentTimeMillis()
             if (config.refreshToken == "") {
                 log.d("No refresh token.  Proceeding to login screen")
                 loadUrl(view, getAuthUrl(getHAUrl(config, withDashboardPath = false)), clearCache = true)
                 setAuthStage(view, PageLoadingStage.AUTH_FAILED)
                 return
-            } else if (System.currentTimeMillis() > (config.tokenExpiry - 120) && config.refreshToken != "") {
-                // Token will expire in less than 2 mins, consider expired
-                // Need to get new access token as it has expired
-                log.d("Auth token has expired.  Requesting new token using refresh token")
+            } else if (remainingMs <= MIN_TOKEN_LIFETIME_FOR_PAGE_MS && config.refreshToken != "") {
+                log.d("Access token remaining lifetime ${remainingMs}ms is too short for page use. Refreshing first")
+                val success: Boolean = reAuthWithRefreshToken()
+                if (success) {
+                    log.d("Authorising with refreshed token for page load")
+                    callAuthJS(view)
+                    setAuthStage(view, PageLoadingStage.AUTHORISED)
+                } else {
+                    log.d("Failed to refresh short-lived auth token. Proceeding to login screen")
+                    setAuthStage(view, PageLoadingStage.AUTH_FAILED)
+                    loadUrl(view, getAuthUrl(getHAUrl(config, withDashboardPath = false)), clearCache = true)
+                }
+            } else if (System.currentTimeMillis() > (effectiveExpiry - AUTH_REFRESH_BUFFER_MS) && config.refreshToken != "") {
+                log.d("Auth token is near expiry. Requesting new token using refresh token")
                 val success: Boolean = reAuthWithRefreshToken()
                 if (success) {
                     log.d("Authorising with new token")
                     callAuthJS(view)
                     setAuthStage(view, PageLoadingStage.AUTHORISED)
                 } else {
-                    log.d("Failed to refresh auth token.  Proceeding to login screen")
+                    log.d("Failed to refresh auth token. Proceeding to login screen")
                     setAuthStage(view, PageLoadingStage.AUTH_FAILED)
                     loadUrl(view, getAuthUrl(getHAUrl(config, withDashboardPath = false)), clearCache = true)
                 }
@@ -55,6 +71,7 @@ class AuthUtils(val config: APPConfig) {
 
         override fun onRequestRevokeExternalAuth(view: WebView) {
             log.d("External auth revoke callback in progress...")
+            stopAuthHeartbeat()
             config.accessToken = ""
             config.refreshToken = ""
             config.tokenExpiry = 0
@@ -81,14 +98,102 @@ class AuthUtils(val config: APPConfig) {
 
         private fun callAuthJS(view: WebView) {
             Handler(Looper.getMainLooper()).post({
-                view.evaluateJavascript(
-                    "window.externalAuthSetToken(true, {\n" +
-                            "\"access_token\": \"${config.accessToken}\",\n" +
-                            "\"expires_in\": 1800\n" +
-                            "});",
-                    null
-                )
+                val expiresInSeconds = ((getEffectiveTokenExpiry() - System.currentTimeMillis()) / 1000L)
+                    .coerceAtLeast(60L)
+                val js = """
+                    (function() {
+                        const token = {
+                            access_token: "${config.accessToken}",
+                            expires_in: $expiresInSeconds
+                        };
+                        const inject = function() {
+                            if (typeof window.externalAuthSetToken !== "function") {
+                                return false;
+                            }
+                            window.externalAuthSetToken(true, token);
+                            return true;
+                        };
+                        if (inject()) {
+                            return "called";
+                        }
+                        let attempts = 0;
+                        const maxAttempts = 20;
+                        const retryHandle = window.setInterval(function() {
+                            attempts += 1;
+                            if (inject() || attempts >= maxAttempts) {
+                                window.clearInterval(retryHandle);
+                            }
+                        }, 500);
+                        return "scheduled";
+                    })();
+                """.trimIndent()
+                log.d("Auth JS injection expiresInSeconds=$expiresInSeconds")
+                view.evaluateJavascript(js) { result ->
+                    log.d("Auth JS callback result: $result")
+                }
+                ensureAuthHeartbeat(view)
             })
+        }
+
+        private fun ensureAuthHeartbeat(view: WebView) {
+            if (refreshRunnable != null) {
+                return
+            }
+            refreshRunnable = object : Runnable {
+                override fun run() {
+                    try {
+                        val currentUrl = view.url.orEmpty()
+                        val haBaseUrl = getHAUrl(config, withDashboardPath = false).removeSuffix("/")
+                        if (config.refreshToken.isBlank() || config.accessToken.isBlank()) {
+                            log.d("Auth heartbeat stopping because tokens are unavailable")
+                            stopAuthHeartbeat()
+                            return
+                        }
+                        if (!currentUrl.startsWith(haBaseUrl, ignoreCase = true)) {
+                            log.d("Auth heartbeat skipped currentUrl=$currentUrl")
+                        } else {
+                            val now = System.currentTimeMillis()
+                            val effectiveExpiry = getEffectiveTokenExpiry()
+                            if (now > (effectiveExpiry - AUTH_REFRESH_BUFFER_MS)) {
+                                log.d("Auth heartbeat proactively refreshing token")
+                                if (reAuthWithRefreshToken()) {
+                                    log.d("Auth heartbeat authorising with refreshed token")
+                                    callAuthJS(view)
+                                } else {
+                                    log.d("Auth heartbeat failed to refresh token")
+                                }
+                            } else {
+                                log.d("Auth heartbeat reinjecting current token effectiveExpiry=$effectiveExpiry")
+                                callAuthJS(view)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        log.e("Auth heartbeat error: ${e.message}")
+                    } finally {
+                        if (refreshRunnable != null) {
+                            refreshHandler.postDelayed(this, AUTH_HEARTBEAT_INTERVAL_MS)
+                        }
+                    }
+                }
+            }
+            log.d("Auth heartbeat started intervalMs=$AUTH_HEARTBEAT_INTERVAL_MS")
+            refreshHandler.postDelayed(refreshRunnable!!, AUTH_HEARTBEAT_INTERVAL_MS)
+        }
+
+        private fun stopAuthHeartbeat() {
+            refreshRunnable?.let { refreshHandler.removeCallbacks(it) }
+            refreshRunnable = null
+        }
+
+        private fun getEffectiveTokenExpiry(): Long {
+            val jwtExpiry = getTokenExpiryFromJwt(config.accessToken)
+            if (jwtExpiry != null) {
+                if (config.tokenExpiry != jwtExpiry) {
+                    config.tokenExpiry = jwtExpiry
+                }
+                return jwtExpiry
+            }
+            return config.tokenExpiry
         }
 
         private fun reAuthWithRefreshToken(): Boolean {
@@ -112,6 +217,9 @@ class AuthUtils(val config: APPConfig) {
     companion object {
         val log = Logger()
         const val CLIENT_URL = "vaca.homeassistant"
+        const val AUTH_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000L
+        const val AUTH_REFRESH_BUFFER_MS = 10 * 60 * 1000L
+        const val MIN_TOKEN_LIFETIME_FOR_PAGE_MS = 25 * 60 * 1000L
         var state: String = ""
 
         fun getHAUrl(config: APPConfig, withDashboardPath: Boolean = true): String {
@@ -224,7 +332,8 @@ class AuthUtils(val config: APPConfig) {
                     return AuthToken()
                 }
                 
-                val expiresIn = System.currentTimeMillis() + (expiresInSeconds * 1000)
+                val expiresIn = getTokenExpiryFromJwt(accessToken)
+                    ?: (System.currentTimeMillis() + (expiresInSeconds * 1000L))
 
                 return AuthToken(
                     tokenType,
@@ -265,7 +374,8 @@ class AuthUtils(val config: APPConfig) {
                     return AuthToken()
                 }
 
-                val expiresIn = System.currentTimeMillis() + (expiresInSeconds * 1000)
+                val expiresIn = getTokenExpiryFromJwt(accessToken)
+                    ?: (System.currentTimeMillis() + (expiresInSeconds * 1000L))
 
                 return AuthToken(
                     tokenType,
@@ -306,6 +416,24 @@ class AuthUtils(val config: APPConfig) {
             } catch (e: Exception) {
                 log.e("Error authorising with HA: ${e.message.toString()}")
                 return ""
+            }
+        }
+
+        fun getTokenExpiryFromJwt(accessToken: String): Long? {
+            if (accessToken.isBlank()) {
+                return null
+            }
+            return try {
+                val parts = accessToken.split(".")
+                if (parts.size < 2) {
+                    return null
+                }
+                val payload = String(Base64.getUrlDecoder().decode(parts[1]), Charsets.UTF_8)
+                val json = Json.parseToJsonElement(payload).jsonObject
+                json["exp"]?.jsonPrimitive?.longOrNull?.times(1000L)
+            } catch (e: Exception) {
+                log.w("Unable to parse JWT expiry: ${e.message}")
+                null
             }
         }
 

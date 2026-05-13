@@ -26,6 +26,7 @@ import androidx.core.net.toUri
 class CustomWebViewClient(val viewModel: VAViewModel): WebViewClientCompat()  {
     val log = Logger()
     val config = viewModel.config
+    val authUtils = AuthUtils(config)
     private val firebase = FirebaseManager.getInstance(config.context)
     private val resources = viewModel.resources
 
@@ -131,6 +132,18 @@ class CustomWebViewClient(val viewModel: VAViewModel): WebViewClientCompat()  {
     }
 
     override fun onPageFinished(view: WebView?, url: String?) {
+        val haBaseUrl = AuthUtils.getHAUrl(config, withDashboardPath = false).removeSuffix("/")
+        if (
+            view != null &&
+            !url.isNullOrBlank() &&
+            url.startsWith(haBaseUrl, ignoreCase = true) &&
+            !url.contains("/auth/authorize") &&
+            config.accessToken.isNotBlank() &&
+            config.refreshToken.isNotBlank()
+        ) {
+            log.d("Proactively injecting external auth after page load: $url")
+            authUtils.externalAuthCallback.onRequestExternalAuth(view)
+        }
         if (url != ERROR_URL && viewModel.vacaState.value.webViewPageLoadingStage == PageLoadingStage.AUTHORISED) {
             Handler(Looper.getMainLooper()).postDelayed({
                 setPageLoadingState(PageLoadingStage.LOADED)
